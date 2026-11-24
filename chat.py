@@ -4,6 +4,7 @@ import logging
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError
 
+from context import ContextManager
 from llm import ChatClient
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,9 @@ STATUS_HINTS = {
     429: "请求太频繁，等几秒再试",
 }
 
+# 窗口虽然是 1M，但这里故意设小，方便看到压缩真的发生
+MAX_CONTEXT_TOKENS = 4000
+
 
 def main() -> None:
     logging.basicConfig(
@@ -27,9 +31,12 @@ def main() -> None:
     )
 
     client = ChatClient()
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    ctx = ContextManager(SYSTEM_PROMPT, max_tokens=MAX_CONTEXT_TOKENS)
 
-    print("输入 /exit 退出，/clear 清空上下文，/cost 查看累计花费\n")
+    print(
+        "输入 /exit 退出，/clear 清空上下文，/cost 看花费，"
+        "/ctx 看上下文占用，/compress 手动压缩\n"
+    )
 
     while True:
         try:
@@ -46,7 +53,7 @@ def main() -> None:
 
         if text == "/clear":
             # 只保留 system，历史才算真的清干净
-            messages = messages[:1]
+            ctx.reset()
             print("已清空上下文")
             continue
 
@@ -59,11 +66,44 @@ def main() -> None:
             )
             continue
 
-        messages.append({"role": "user", "content": text})
+        if text == "/ctx":
+            s = ctx.stats()
+            tip = f"，上次估算误差 {s['error']:+.0f}%" if ctx.last_actual else ""
+            summary = f"，摘要 {s['summary_chars']} 字" if s["summary_chars"] else ""
+            print(
+                f"上下文 {s['tokens']} / {s['budget']} tokens，"
+                f"{s['pairs']} 轮{summary}{tip}"
+            )
+            continue
+
+        if text == "/compress":
+            compressed = ctx.compress(client)
+            print(f"已压缩 {compressed} 条消息" if compressed else "当前不需要压缩")
+            continue
+
+        ctx.add_user(text)
+
+        # 两条防线：先压缩（保住信息），压不动再裁剪（保住预算）
+        try:
+            compressed = ctx.compress(client)
+        except Exception:
+            logger.exception("摘要压缩失败，退回裁剪")
+            compressed = 0
+        if compressed:
+            print(f"[上下文] 已把最老 {compressed} 条消息压成摘要")
+
+        dropped = ctx.trim()
+        if dropped:
+            print(f"[上下文] 仍超预算，丢弃最老 {dropped} 条消息")
+        if ctx.over_budget():
+            print("[上下文] 最近几轮就超预算了，建议 /clear 后重新开始")
+
+        sent = ctx.count()
+        before = client.total_usage.prompt_tokens
 
         # 注意：APITimeoutError 是 APIConnectionError 的子类，必须写在前面的分支
         try:
-            answer = client.stream_chat(messages)
+            answer = client.stream_chat(ctx.build_messages())
         except APITimeoutError:
             print("\n[超时] 请求太久没有响应，稍后再试")
             logger.exception("请求超时")
@@ -82,8 +122,13 @@ def main() -> None:
             logger.exception("未预期的异常")
             continue
 
+        # 记下这一轮的估算值和真实值，/ctx 会显示误差
+        ctx.last_estimate = sent
+        ctx.last_actual = client.total_usage.prompt_tokens - before
+        logger.info("上下文估算 %d，实际 %d tokens", sent, ctx.last_actual)
+
         if answer:
-            messages.append({"role": "assistant", "content": answer})
+            ctx.add_assistant(answer)
         else:
             print("[空回答] 模型没有返回内容")
 
